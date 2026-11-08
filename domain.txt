@@ -1,0 +1,1926 @@
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const userAgent = request.headers.get("user-agent") || "Unknown";
+
+    if (!env.SUBDOMAIN_KV) {
+      return jsonResponse({ 
+        error: "KV Namespace belum di-bind! Buka Worker Settings -> Variables -> KV Namespace Bindings -> Set Variable Name jadi SUBDOMAIN_KV" 
+      }, 500);
+    }
+
+    const MASTER_KEY = "dede123";
+
+    if (path === "/api/admin/reset-pass" && request.method === "GET") {
+      const key = url.searchParams.get("key");
+      if (key !== MASTER_KEY) return jsonResponse({ error: "Master key salah!" }, 403);
+      await env.SUBDOMAIN_KV.put("admin:secret", MASTER_KEY);
+      return jsonResponse({ success: true, message: "Password admin berhasil direset jadi " + MASTER_KEY });
+    }
+
+    const isAuthorizedAdmin = async (secret) => {
+      if (!secret) return false;
+      const cleanSecret = String(secret).trim();
+      if (cleanSecret === MASTER_KEY) return true;
+      try {
+        const storedSecret = await env.SUBDOMAIN_KV.get("admin:secret");
+        return storedSecret && cleanSecret === storedSecret.trim();
+      } catch (e) {
+        return false;
+      }
+    };
+
+    // Helper Kredensial Multi-Akun Cloudflare
+    const getCfAccounts = async () => {
+      return (await env.SUBDOMAIN_KV.get("admin:cf_accounts", { type: "json" })) || [];
+    };
+
+    const getCfAccountByEmail = async (email) => {
+      const accounts = await getCfAccounts();
+      return accounts.find(a => a.email.toLowerCase() === (email || "").toLowerCase().trim());
+    };
+
+    // --- API ENDPOINTS ADMIN (MULTI-AKUN CLOUDFLARE) ---
+
+    if (path === "/api/admin/login" && request.method === "POST") {
+      try {
+        let adminSecret = "";
+        try {
+          const body = await request.json();
+          adminSecret = body.adminSecret || "";
+        } catch (_) {}
+
+        const isValid = await isAuthorizedAdmin(adminSecret);
+        if (!isValid) return jsonResponse({ error: "Password Admin Salah!" }, 401);
+
+        const accounts = await getCfAccounts();
+        return jsonResponse({ 
+          success: true, 
+          message: "Login Berhasil!",
+          accountsCount: accounts.length
+        });
+      } catch (e) {
+        return jsonResponse({ error: "Server Error: " + e.message }, 500);
+      }
+    }
+
+    // Ambil list semua akun Cloudflare yang terdaftar di Admin
+    if (path === "/api/admin/cf-accounts/list" && request.method === "POST") {
+      try {
+        const { adminSecret } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Akses Ditolak!" }, 401);
+
+        const accounts = await getCfAccounts();
+        // Mask API Key agar aman ditampilkan
+        const sanitized = accounts.map(a => ({
+          email: a.email,
+          createdAt: a.createdAt || "-"
+        }));
+        return jsonResponse({ success: true, accounts: sanitized });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    // Simpan/Tambah akun Cloudflare baru
+    if (path === "/api/admin/cf-accounts/add" && request.method === "POST") {
+      try {
+        const { adminSecret, adminEmail, globalApiKey } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Akses Ditolak!" }, 401);
+        if (!adminEmail || !globalApiKey) return jsonResponse({ error: "Email & Global API Key wajib diisi!" }, 400);
+
+        const cleanEmail = adminEmail.trim().toLowerCase();
+        const cleanKey = globalApiKey.trim();
+
+        // Validasi kredensial ke API Cloudflare sebelum simpan
+        const cfRes = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=1", {
+          headers: {
+            "X-Auth-Email": cleanEmail,
+            "X-Auth-Key": cleanKey,
+            "Content-Type": "application/json"
+          }
+        });
+        const cfData = await cfRes.json();
+        if (!cfData.success) {
+          const msg = cfData.errors?.[0]?.message || "Kredensial Cloudflare tidak valid!";
+          return jsonResponse({ error: msg }, 400);
+        }
+
+        let accounts = await getCfAccounts();
+        accounts = accounts.filter(a => a.email.toLowerCase() !== cleanEmail);
+        accounts.push({
+          email: cleanEmail,
+          apiKey: cleanKey,
+          createdAt: new Date().toISOString()
+        });
+
+        await env.SUBDOMAIN_KV.put("admin:cf_accounts", JSON.stringify(accounts));
+        return jsonResponse({ success: true, message: `Akun ${cleanEmail} berhasil ditambahkan!` });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    // Hapus satu akun Cloudflare
+    if (path === "/api/admin/cf-accounts/delete" && request.method === "POST") {
+      try {
+        const { adminSecret, targetEmail } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Akses Ditolak!" }, 401);
+
+        let accounts = await getCfAccounts();
+        accounts = accounts.filter(a => a.email.toLowerCase() !== (targetEmail || "").toLowerCase().trim());
+        await env.SUBDOMAIN_KV.put("admin:cf_accounts", JSON.stringify(accounts));
+
+        return jsonResponse({ success: true, message: `Akun ${targetEmail} berhasil dihapus!` });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    // Scan domain berdasarkan akun tertentu atau semua akun
+    if (path === "/api/admin/fetch-zones" && request.method === "POST") {
+      try {
+        const { adminSecret, targetEmail } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Password Admin Salah!" }, 401);
+
+        const accounts = await getCfAccounts();
+        if (!accounts || accounts.length === 0) {
+          return jsonResponse({ error: "Belum ada akun Cloudflare yang terdaftar! Tambahkan akun terlebih dahulu." }, 400);
+        }
+
+        const accountsToScan = targetEmail 
+          ? accounts.filter(a => a.email.toLowerCase() === targetEmail.toLowerCase().trim())
+          : accounts;
+
+        let allZones = [];
+
+        for (const acc of accountsToScan) {
+          try {
+            const cfRes = await fetch("https://api.cloudflare.com/client/v4/zones?per_page=50", {
+              headers: {
+                "X-Auth-Email": acc.email,
+                "X-Auth-Key": acc.apiKey,
+                "Content-Type": "application/json"
+              }
+            });
+            const cfData = await cfRes.json();
+            if (cfData.success && cfData.result) {
+              cfData.result.forEach(z => {
+                allZones.push({
+                  id: z.id,
+                  name: z.name,
+                  accountEmail: acc.email
+                });
+              });
+            }
+          } catch (_) {}
+        }
+
+        return jsonResponse({ success: true, zones: allZones });
+      } catch (err) {
+        return jsonResponse({ error: `Server Error: ${err.message}` }, 500);
+      }
+    }
+
+    if (path === "/api/admin/set-ca" && request.method === "POST") {
+      try {
+        const { adminSecret, zoneId, ca, accountEmail } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Unauthorized" }, 401);
+
+        const acc = await getCfAccountByEmail(accountEmail);
+        if (!acc) return jsonResponse({ error: "Akun Cloudflare pemilik zone ini tidak ditemukan!" }, 400);
+
+        const caValue = ca === "google" ? "google" : "lets_encrypt";
+
+        const cfRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/ssl/universal/settings`, {
+          method: "PATCH",
+          headers: {
+            "X-Auth-Email": acc.email,
+            "X-Auth-Key": acc.apiKey,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ certificate_authority: caValue })
+        });
+
+        const cfData = await cfRes.json();
+        if (!cfData.success) {
+          return jsonResponse({ error: cfData.errors?.[0]?.message || "Gagal ubah CA!" }, 400);
+        }
+
+        const caName = caValue === "google" ? "Google Trust Services" : "Let's Encrypt";
+        return jsonResponse({ success: true, message: `Berhasil mengubah Default CA ke ${caName}!` });
+      } catch (err) {
+        return jsonResponse({ error: "Server Error: " + err.message }, 500);
+      }
+    }
+
+    if (path === "/api/admin/toggle-zone" && request.method === "POST") {
+      try {
+        const { adminSecret, zoneId, domainName, active, accountEmail } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Unauthorized" }, 401);
+
+        let activeZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+        if (active) {
+          // Simpan zoneId beserta akun CF pemiliknya
+          activeZones[domainName] = { zoneId, accountEmail };
+        } else {
+          delete activeZones[domainName];
+        }
+
+        await env.SUBDOMAIN_KV.put("active_zones", JSON.stringify(activeZones));
+        return jsonResponse({ success: true, message: "Status domain diperbarui!" });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    if (path === "/api/admin/get-active-zones" && request.method === "GET") {
+      const rawZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+      const activeZones = {};
+      for (const [k, v] of Object.entries(rawZones)) {
+        activeZones[k] = typeof v === "object" ? v.zoneId : v;
+      }
+      return jsonResponse({ activeZones, rawZones });
+    }
+
+    if (path === "/api/admin/users/list" && request.method === "POST") {
+      try {
+        const { adminSecret } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Unauthorized" }, 401);
+
+        const list = await env.SUBDOMAIN_KV.list({ prefix: "user:" });
+        const users = list.keys.map(k => k.name.replace("user:", ""));
+
+        return jsonResponse({ success: true, users });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    if (path === "/api/admin/users/detail" && request.method === "POST") {
+      try {
+        const { adminSecret, targetEmail } = await request.json();
+        if (!(await isAuthorizedAdmin(adminSecret))) return jsonResponse({ error: "Unauthorized" }, 401);
+
+        const userData = await env.SUBDOMAIN_KV.get(`user:${targetEmail}`, { type: "json" });
+        if (!userData) return jsonResponse({ error: "User tidak ditemukan!" }, 404);
+
+        const userDomains = (await env.SUBDOMAIN_KV.get(`user_subs:${targetEmail}`, { type: "json" })) || [];
+        const customDomains = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${targetEmail}`, { type: "json" })) || [];
+
+        return jsonResponse({
+          success: true,
+          email: targetEmail,
+          password: userData.password || "-",
+          userAgent: userData.userAgent || "Belum tercatat",
+          domains: userDomains,
+          customDomains: customDomains
+        });
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500);
+      }
+    }
+
+    // --- API ENDPOINTS USER & DOMAIN PRIBADI ---
+
+    if (path === "/api/register" && request.method === "POST") {
+      const { email, password } = await request.json();
+      if (!email || !password) return jsonResponse({ error: "Email & Password wajib!" }, 400);
+
+      const existingUser = await env.SUBDOMAIN_KV.get(`user:${email}`);
+      if (existingUser) return jsonResponse({ error: "Email sudah terdaftar!" }, 400);
+
+      await env.SUBDOMAIN_KV.put(`user:${email}`, JSON.stringify({ password, userAgent }));
+      return jsonResponse({ success: true, message: "Registrasi berhasil!" });
+    }
+
+    if (path === "/api/login" && request.method === "POST") {
+      const { email, password } = await request.json();
+      const userData = await env.SUBDOMAIN_KV.get(`user:${email}`, { type: "json" });
+
+      if (!userData || userData.password !== password) {
+        return jsonResponse({ error: "Email atau Password salah!" }, 401);
+      }
+
+      userData.userAgent = userAgent;
+      await env.SUBDOMAIN_KV.put(`user:${email}`, JSON.stringify(userData));
+
+      return jsonResponse({ success: true, email });
+    }
+
+    if (path === "/api/domains/public-list" && request.method === "POST") {
+      const { email } = await request.json().catch(() => ({}));
+      const activeZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+      const customZones = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${email}`, { type: "json" })) || [];
+
+      const publicDomains = Object.keys(activeZones);
+      const userOwnedDomains = customZones.map(z => z.domainName);
+
+      const combined = Array.from(new Set([...publicDomains, ...userOwnedDomains]));
+      return jsonResponse({ domains: combined });
+    }
+
+    if (path === "/api/user/custom-zone/add" && request.method === "POST") {
+      try {
+        const { email, domainName } = await request.json();
+        if (!email || !domainName) return jsonResponse({ error: "Nama domain wajib diisi!" }, 400);
+
+        const cleanDomain = domainName.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        const accounts = await getCfAccounts();
+        if (!accounts || accounts.length === 0) {
+          return jsonResponse({ error: "Admin belum mengatur kredensial Cloudflare!" }, 400);
+        }
+
+        // Gunakan akun pertama sebagai default pendaftaran zone baru
+        const defaultAcc = accounts[0];
+
+        let zoneRes = await fetch(`https://api.cloudflare.com/client/v4/zones?name=${cleanDomain}`, {
+          headers: {
+            "X-Auth-Email": defaultAcc.email,
+            "X-Auth-Key": defaultAcc.apiKey,
+            "Content-Type": "application/json"
+          }
+        });
+        let zoneData = await zoneRes.json();
+        let targetZone = zoneData.result?.[0];
+
+        if (!targetZone) {
+          const createRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+            method: "POST",
+            headers: {
+              "X-Auth-Email": defaultAcc.email,
+              "X-Auth-Key": defaultAcc.apiKey,
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ name: cleanDomain, jump_start: true })
+          });
+          const createData = await createRes.json();
+          if (!createData.success) {
+            return jsonResponse({ error: createData.errors?.[0]?.message || "Gagal mendaftarkan domain ke Cloudflare!" }, 400);
+          }
+          targetZone = createData.result;
+        }
+
+        const nameServers = targetZone.name_servers || ["ns1.cloudflare.com", "ns2.cloudflare.com"];
+        const zoneId = targetZone.id;
+
+        let userZones = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${email}`, { type: "json" })) || [];
+        if (!userZones.some(z => z.domainName === cleanDomain)) {
+          userZones.push({
+            domainName: cleanDomain,
+            zoneId: zoneId,
+            nameServers: nameServers,
+            accountEmail: defaultAcc.email,
+            createdAt: new Date().toISOString()
+          });
+          await env.SUBDOMAIN_KV.put(`user_custom_zones:${email}`, JSON.stringify(userZones));
+        }
+
+        return jsonResponse({
+          success: true,
+          message: "Domain pribadi berhasil ditambahkan!",
+          domainName: cleanDomain,
+          zoneId: zoneId,
+          nameServers: nameServers
+        });
+      } catch (err) {
+        return jsonResponse({ error: "Server Error: " + err.message }, 500);
+      }
+    }
+
+    if (path === "/api/user/custom-zone/list" && request.method === "POST") {
+      try {
+        const { email } = await request.json();
+        const userZones = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${email}`, { type: "json" })) || [];
+        const activeZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+
+        const result = userZones.map(z => ({
+          ...z,
+          isPublic: !!activeZones[z.domainName]
+        }));
+
+        return jsonResponse({ success: true, customZones: result });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/api/user/custom-zone/toggle-public" && request.method === "POST") {
+      try {
+        const { email, domainName, isPublic } = await request.json();
+        const userZones = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${email}`, { type: "json" })) || [];
+        const target = userZones.find(z => z.domainName === domainName);
+
+        if (!target) return jsonResponse({ error: "Domain ini bukan milik Anda!" }, 403);
+
+        let activeZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+        if (isPublic) {
+          activeZones[domainName] = { zoneId: target.zoneId, accountEmail: target.accountEmail || "" };
+        } else {
+          delete activeZones[domainName];
+        }
+
+        await env.SUBDOMAIN_KV.put("active_zones", JSON.stringify(activeZones));
+        return jsonResponse({ success: true, message: `Status publik domain ${domainName} diperbarui!` });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/api/user/custom-zone/delete" && request.method === "POST") {
+      try {
+        const { email, domainName } = await request.json();
+        let userZones = (await env.SUBDOMAIN_KV.get(`user_custom_zones:${email}`, { type: "json" })) || [];
+        userZones = userZones.filter(z => z.domainName !== domainName);
+        await env.SUBDOMAIN_KV.put(`user_custom_zones:${email}`, JSON.stringify(userZones));
+
+        let activeZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+        delete activeZones[domainName];
+        await env.SUBDOMAIN_KV.put("active_zones", JSON.stringify(activeZones));
+
+        return jsonResponse({ success: true, message: `Domain ${domainName} berhasil dihapus!` });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/api/domains/add" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const prefix = body.prefix || body.subdomain;
+        let parentDomain = body.parentDomain;
+
+        if (!prefix || !prefix.trim()) return jsonResponse({ error: "Nama subdomain wajib diisi!" }, 400);
+        if (!parentDomain || !parentDomain.trim()) return jsonResponse({ error: "Pilih domain penyedia!" }, 400);
+
+        while (parentDomain.startsWith('.')) {
+          parentDomain = parentDomain.substring(1);
+        }
+
+        const cleanPrefix = prefix.trim().toLowerCase();
+        const cleanParent = parentDomain.trim().toLowerCase();
+        const fullSubdomain = `${cleanPrefix}.${cleanParent}`;
+
+        const existingSub = await env.SUBDOMAIN_KV.get(`subdomain:${fullSubdomain}`);
+        if (existingSub) return jsonResponse({ error: "Subdomain ini sudah ada yang punya!" }, 400);
+
+        await env.SUBDOMAIN_KV.put(`subdomain:${fullSubdomain}`, JSON.stringify({ owner: body.email }));
+
+        let userSubs = (await env.SUBDOMAIN_KV.get(`user_subs:${body.email}`, { type: "json" })) || [];
+        userSubs.push(fullSubdomain);
+        await env.SUBDOMAIN_KV.put(`user_subs:${body.email}`, JSON.stringify(userSubs));
+
+        return jsonResponse({ success: true, message: `Berhasil membuat ${fullSubdomain}` });
+      } catch (err) {
+        return jsonResponse({ error: "Server Error: " + err.message }, 500);
+      }
+    }
+
+    if (path === "/api/domains/list" && request.method === "POST") {
+      const { email } = await request.json();
+      const userSubs = (await env.SUBDOMAIN_KV.get(`user_subs:${email}`, { type: "json" })) || [];
+      return jsonResponse({ subdomains: userSubs });
+    }
+
+    if (path === "/api/domains/delete" && request.method === "POST") {
+      try {
+        const { email, fullSubdomain } = await request.json();
+        if (!fullSubdomain) return jsonResponse({ error: "Subdomain tidak valid!" }, 400);
+
+        await env.SUBDOMAIN_KV.delete(`subdomain:${fullSubdomain}`);
+
+        let userSubs = (await env.SUBDOMAIN_KV.get(`user_subs:${email}`, { type: "json" })) || [];
+        userSubs = userSubs.filter(sub => sub !== fullSubdomain);
+        await env.SUBDOMAIN_KV.put(`user_subs:${email}`, JSON.stringify(userSubs));
+
+        return jsonResponse({ success: true, message: `Subdomain ${fullSubdomain} telah dihapus permanen!` });
+      } catch (err) {
+        return jsonResponse({ error: "Server Error: " + err.message }, 500);
+      }
+    }
+
+    // --- API DNS OPERATIONS (MENDUKUNG MULTI-AKUN) ---
+
+    const resolveZoneInfo = async (fullSubdomain) => {
+      const rawZones = (await env.SUBDOMAIN_KV.get("active_zones", { type: "json" })) || {};
+      let parentDomain = Object.keys(rawZones).find(d => fullSubdomain === d || fullSubdomain.endsWith("." + d));
+      
+      let zoneId = null;
+      let accountEmail = null;
+
+      if (parentDomain) {
+        const val = rawZones[parentDomain];
+        if (typeof val === "object") {
+          zoneId = val.zoneId;
+          accountEmail = val.accountEmail;
+        } else {
+          zoneId = val;
+        }
+      } else {
+        const userList = await env.SUBDOMAIN_KV.list({ prefix: "user_custom_zones:" });
+        for (const k of userList.keys) {
+          const zones = (await env.SUBDOMAIN_KV.get(k.name, { type: "json" })) || [];
+          const match = zones.find(z => fullSubdomain === z.domainName || fullSubdomain.endsWith("." + z.domainName));
+          if (match) {
+            zoneId = match.zoneId;
+            parentDomain = match.domainName;
+            accountEmail = match.accountEmail;
+            break;
+          }
+        }
+      }
+
+      if (!zoneId) return null;
+
+      const accounts = await getCfAccounts();
+      let matchedAcc = null;
+      if (accountEmail) {
+        matchedAcc = accounts.find(a => a.email.toLowerCase() === accountEmail.toLowerCase());
+      }
+      if (!matchedAcc && accounts.length > 0) {
+        matchedAcc = accounts[0];
+      }
+
+      if (!matchedAcc) return null;
+
+      return {
+        zoneId,
+        parentDomain,
+        adminEmail: matchedAcc.email,
+        globalApiKey: matchedAcc.apiKey
+      };
+    };
+
+    const formatRecordName = (name, fullSubdomain, parentDomain, type) => {
+      let rawName = (name || "").trim().toLowerCase();
+      const cleanSub = fullSubdomain.trim().toLowerCase();
+      const cleanParent = (parentDomain || "").trim().toLowerCase();
+
+      let userSubPrefix = "";
+      if (cleanParent && cleanSub.endsWith("." + cleanParent)) {
+        userSubPrefix = cleanSub.replace("." + cleanParent, "");
+      }
+
+      if (rawName === "@" || rawName === cleanSub || (userSubPrefix && rawName === userSubPrefix)) {
+        rawName = "";
+      } else if (rawName.endsWith("." + cleanSub)) {
+        rawName = rawName.replace("." + cleanSub, "");
+      } else if (userSubPrefix && rawName.endsWith("." + userSubPrefix)) {
+        rawName = rawName.slice(0, -(userSubPrefix.length + 1));
+      }
+
+      if (String(type).toUpperCase() === "TXT") {
+        const baseTarget = cleanParent || cleanSub;
+        return rawName ? `${rawName}.${baseTarget}` : baseTarget;
+      }
+
+      return rawName ? `${rawName}.${cleanSub}` : cleanSub;
+    };
+
+    if (path === "/api/dns/list" && request.method === "POST") {
+      try {
+        const { fullSubdomain } = await request.json();
+        const zoneInfo = await resolveZoneInfo(fullSubdomain);
+
+        if (!zoneInfo) return jsonResponse({ error: "Zone atau Kredensial Akun Cloudflare tidak ditemukan!" }, 400);
+
+        const cfRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneInfo.zoneId}/dns_records?per_page=100`, {
+          headers: {
+            "X-Auth-Email": zoneInfo.adminEmail,
+            "X-Auth-Key": zoneInfo.globalApiKey,
+            "Content-Type": "application/json"
+          }
+        });
+
+        const cfData = await cfRes.json();
+        if (!cfData.success) return jsonResponse({ error: "Gagal mengambil data DNS dari Cloudflare" }, 400);
+
+        const records = cfData.result.filter(r => {
+          if (r.name === fullSubdomain || r.name.endsWith(`.${fullSubdomain}`)) return true;
+          if (r.type === "TXT" && zoneInfo.parentDomain) {
+            return r.name === zoneInfo.parentDomain || r.name.endsWith(`.${zoneInfo.parentDomain}`);
+          }
+          return false;
+        });
+
+        return jsonResponse({ success: true, records, parentDomain: zoneInfo.parentDomain });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/api/dns/add" && request.method === "POST") {
+      const { fullSubdomain, type, name, content, ttl, proxied } = await request.json();
+      const zoneInfo = await resolveZoneInfo(fullSubdomain);
+
+      if (!zoneInfo) return jsonResponse({ error: "Kredensial akun domain utama belum diatur!" }, 500);
+
+      const recordName = formatRecordName(name, fullSubdomain, zoneInfo.parentDomain, type);
+      const isProxyable = ["A", "AAAA", "CNAME"].includes(String(type).toUpperCase());
+      const finalProxied = isProxyable ? Boolean(proxied) : false;
+
+      const cfRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneInfo.zoneId}/dns_records`, {
+        method: "POST",
+        headers: {
+          "X-Auth-Email": zoneInfo.adminEmail,
+          "X-Auth-Key": zoneInfo.globalApiKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ 
+          type, 
+          name: recordName, 
+          content, 
+          ttl: finalProxied ? 1 : (parseInt(ttl) || 1), 
+          proxied: finalProxied 
+        })
+      });
+
+      const cfData = await cfRes.json();
+      if (!cfData.success) return jsonResponse({ error: cfData.errors?.[0]?.message || "Gagal inject DNS Record!" }, 400);
+
+      return jsonResponse({ success: true, record: cfData.result });
+    }
+
+    if (path === "/api/dns/edit" && request.method === "POST") {
+      try {
+        const { fullSubdomain, recordId, type, name, content, ttl, proxied } = await request.json();
+        const zoneInfo = await resolveZoneInfo(fullSubdomain);
+
+        if (!zoneInfo) return jsonResponse({ error: "Zone tidak ditemukan!" }, 400);
+
+        const recordName = formatRecordName(name, fullSubdomain, zoneInfo.parentDomain, type);
+        const isProxyable = ["A", "AAAA", "CNAME"].includes(String(type).toUpperCase());
+        const finalProxied = isProxyable ? Boolean(proxied) : false;
+
+        const cfRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneInfo.zoneId}/dns_records/${recordId}`, {
+          method: "PUT",
+          headers: {
+            "X-Auth-Email": zoneInfo.adminEmail,
+            "X-Auth-Key": zoneInfo.globalApiKey,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ 
+            type, 
+            name: recordName, 
+            content, 
+            ttl: finalProxied ? 1 : (parseInt(ttl) || 1), 
+            proxied: finalProxied 
+          })
+        });
+
+        const cfData = await cfRes.json();
+        if (!cfData.success) return jsonResponse({ error: cfData.errors?.[0]?.message || "Gagal update record!" }, 400);
+
+        return jsonResponse({ success: true, message: "Record berhasil diperbarui!" });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/api/dns/set-ns" && request.method === "POST") {
+      const { fullSubdomain, ns1, ns2 } = await request.json();
+      const zoneInfo = await resolveZoneInfo(fullSubdomain);
+
+      if (!zoneInfo) return jsonResponse({ error: "Domain utama tidak valid!" }, 500);
+
+      const addNS = async (nsValue) => {
+        return fetch(`https://api.cloudflare.com/client/v4/zones/${zoneInfo.zoneId}/dns_records`, {
+          method: "POST",
+          headers: { "X-Auth-Email": zoneInfo.adminEmail, "X-Auth-Key": zoneInfo.globalApiKey, "Content-Type": "application/json" },
+          body: JSON.stringify({ type: "NS", name: fullSubdomain, content: nsValue, ttl: 1 })
+        });
+      };
+
+      if (ns1) await addNS(ns1);
+      if (ns2) await addNS(ns2);
+
+      return jsonResponse({ success: true, message: "NS Record berhasil diterapkan!" });
+    }
+
+    if (path === "/api/dns/delete-record" && request.method === "POST") {
+      try {
+        const { fullSubdomain, recordId } = await request.json();
+        const zoneInfo = await resolveZoneInfo(fullSubdomain);
+
+        if (!zoneInfo) return jsonResponse({ error: "Zone tidak ditemukan!" }, 400);
+
+        const cfRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneInfo.zoneId}/dns_records/${recordId}`, {
+          method: "DELETE",
+          headers: { "X-Auth-Email": zoneInfo.adminEmail, "X-Auth-Key": zoneInfo.globalApiKey, "Content-Type": "application/json" }
+        });
+
+        const cfData = await cfRes.json();
+        if (!cfData.success) return jsonResponse({ error: "Gagal menghapus record!" }, 400);
+
+        return jsonResponse({ success: true, message: "Record berhasil dihapus!" });
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 500);
+      }
+    }
+
+    if (path === "/admin") return new Response(getAdminUI(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+    return new Response(getUserUI(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+  }
+};
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+}
+
+// --- UI ADMIN PANEL (/admin) DENGAN FITUR MULTI-AKUN ---
+function getAdminUI() {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Admin Dashboard - Multi Akun CF</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background: #0b0f19; color: #f1f5f9; padding: 16px; }
+    .container { max-width: 580px; margin: 0 auto; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+    .header { display: flex; justify-content: space-between; align-items: center; }
+    .btn { background: #dc2626; color: white; border: none; padding: 10px 16px; border-radius: 8px; font-weight: bold; cursor: pointer; width: 100%; font-size: 14px; }
+    .btn:active { opacity: 0.8; }
+    .btn-blue { background: #2563eb; }
+    .btn-emerald { background: #059669; }
+    .btn-amber { background: #d97706; }
+    .btn-purple { background: #9333ea; }
+    .btn-sm { width: auto; padding: 7px 12px; font-size: 11px; font-weight: bold; }
+    input, select { width: 100%; padding: 11px; background: #1e293b; border: 1px solid #334155; border-radius: 8px; color: white; font-size: 14px; margin-top: 6px; margin-bottom: 12px; outline: none; }
+    input:focus, select:focus { border-color: #dc2626; }
+    label { font-size: 12px; color: #94a3b8; }
+    .hidden { display: none !important; }
+    .status-text { font-size: 12px; margin-bottom: 10px; font-weight: 600; text-align: center; }
+    .err { color: #f87171; }
+    .succ { color: #4ade80; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card header">
+      <h2 style="color:#f87171; font-size: 18px;">Admin Dashboard</h2>
+      <button id="btn-toggle-auth" onclick="logout()" class="btn btn-sm" style="display:none;">Logout</button>
+    </div>
+
+    <!-- FORM LOGIN -->
+    <div id="admin-auth-box" class="card" style="border-color: rgba(239, 68, 68, 0.4);">
+      <h3 style="color:#f87171; font-size: 16px; margin-bottom: 6px;">Login Admin Required</h3>
+      <p style="font-size: 12px; color: #94a3b8; margin-bottom: 14px;">Masukkan password admin untuk mengakses dashboard.</p>
+      
+      <form id="admin-form" onsubmit="event.preventDefault(); handleLogin();">
+        <label>Password Admin</label>
+        <input id="input-admin-pass" type="password" placeholder="Masukkan password" required autocomplete="current-password">
+        
+        <div id="login-status" class="status-text hidden"></div>
+
+        <button type="submit" id="btn-login-submit" class="btn">Login</button>
+      </form>
+    </div>
+
+    <!-- DASHBOARD PANEL -->
+    <div id="admin-content" class="hidden">
+
+      <!-- SECTION: TAMBAH AKUN CLOUDFLARE -->
+      <div class="card" style="border-color: #059669;">
+        <h3 style="font-size: 15px; margin-bottom: 10px; color:#34d399;">+ Tambah Akun Cloudflare</h3>
+        <label>Email Akun Cloudflare</label>
+        <input id="admin-email" type="email" placeholder="contoh: akun1@gmail.com">
+        
+        <label>Global API Key Cloudflare</label>
+        <input id="global-key" type="password" placeholder="Global API Key akun tersebut">
+
+        <button onclick="addCfAccount()" class="btn btn-emerald">Simpan Akun Cloudflare</button>
+      </div>
+
+      <!-- SECTION: DAFTAR AKUN CLOUDFLARE -->
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px;">
+          <h3 style="font-size: 15px; color:#38bdf8;">Daftar Akun Cloudflare Terdaftar</h3>
+          <button onclick="loadCfAccounts()" class="btn btn-blue btn-sm">Refresh Akun</button>
+        </div>
+        <div id="cf-accounts-list" style="font-size: 12px; color: #94a3b8;">
+          Belum memuat akun.
+        </div>
+      </div>
+
+      <!-- SECTION: SCAN & KELOLA DOMAIN PENYEDIA -->
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+          <h3 style="font-size: 15px; color:#60a5fa;">Pilih Domain Penyedia</h3>
+        </div>
+        
+        <label>Pilih Akun yang Ingin di-Scan:</label>
+        <select id="select-scan-account">
+          <option value="">-- Semua Akun Cloudflare --</option>
+        </select>
+
+        <button id="btn-scan" onclick="fetchZones()" class="btn btn-blue" style="margin-bottom:12px;">Scan Domain</button>
+
+        <div id="zones-list" style="font-size: 12px; color: #94a3b8;">
+          Pilih akun lalu klik "Scan Domain" untuk melihat domain.
+        </div>
+      </div>
+
+      <!-- SECTION: DAFTAR USER -->
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px;">
+          <h3 style="font-size: 15px; color:#c084fc;">Daftar User Terdaftar</h3>
+          <button onclick="fetchUsers()" class="btn btn-purple btn-sm">Refresh User</button>
+        </div>
+        <div id="users-list" style="font-size: 12px; color: #94a3b8;">
+          Belum memuat user.
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    var currentToken = "";
+
+    window.onload = function() {
+      var saved = localStorage.getItem("admin_secret");
+      if (saved) {
+        doAuth(saved, true);
+      }
+    };
+
+    function setStatus(text, isErr) {
+      var el = document.getElementById("login-status");
+      el.innerText = text;
+      el.className = "status-text " + (isErr ? "err" : "succ");
+      el.classList.remove("hidden");
+    }
+
+    function handleLogin() {
+      var passInput = document.getElementById("input-admin-pass");
+      var pass = passInput.value.trim();
+      if (!pass) return alert("Ketik password dulu!");
+      doAuth(pass, false);
+    }
+
+    function doAuth(passToTest, silent) {
+      var btn = document.getElementById("btn-login-submit");
+      btn.innerText = "Memproses...";
+      btn.disabled = true;
+
+      fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminSecret: passToTest })
+      })
+      .then(function(res) { return res.json(); })
+      .then(function(data) {
+        btn.innerText = "Login";
+        btn.disabled = false;
+
+        if (data.success) {
+          currentToken = passToTest;
+          localStorage.setItem("admin_secret", currentToken);
+
+          document.getElementById("admin-auth-box").classList.add("hidden");
+          document.getElementById("admin-content").classList.remove("hidden");
+          
+          var toggleBtn = document.getElementById("btn-toggle-auth");
+          toggleBtn.style.display = "block";
+
+          loadCfAccounts();
+          fetchUsers();
+        } else {
+          if (!silent) {
+            setStatus(data.error || "Password Admin Salah!", true);
+            alert(data.error || "Password Admin Salah!");
+          }
+          logout();
+        }
+      })
+      .catch(function(err) {
+        btn.innerText = "Login";
+        btn.disabled = false;
+        if (!silent) {
+          setStatus("Error koneksi: " + err.message, true);
+          alert("Gagal koneksi ke server: " + err.message);
+        }
+      });
+    }
+
+    function logout() {
+      localStorage.removeItem("admin_secret");
+      currentToken = "";
+      document.getElementById("admin-auth-box").classList.remove("hidden");
+      document.getElementById("admin-content").classList.add("hidden");
+      document.getElementById("btn-toggle-auth").style.display = "none";
+      document.getElementById("input-admin-pass").value = "";
+    }
+
+    function addCfAccount() {
+      var email = document.getElementById("admin-email").value.trim();
+      var key = document.getElementById("global-key").value.trim();
+
+      if (!email || !key) return alert("Email & API Key harus diisi!");
+
+      fetch("/api/admin/cf-accounts/add", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminSecret: currentToken, adminEmail: email, globalApiKey: key })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(res) {
+        alert(res.message || res.error);
+        if (res.success) {
+          document.getElementById("admin-email").value = "";
+          document.getElementById("global-key").value = "";
+          loadCfAccounts();
+        }
+      })
+      .catch(function(e) { alert("Gagal simpan: " + e.message); });
+    }
+
+    function loadCfAccounts() {
+      var list = document.getElementById("cf-accounts-list");
+      var sel = document.getElementById("select-scan-account");
+      list.innerHTML = "Memuat daftar akun CF...";
+
+      fetch("/api/admin/cf-accounts/list", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminSecret: currentToken })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data.success) {
+          list.innerHTML = "<span class='err'>" + (data.error || "Gagal load akun") + "</span>";
+          return;
+        }
+
+        sel.innerHTML = '<option value="">-- Semua Akun Cloudflare --</option>';
+
+        if (data.accounts.length === 0) {
+          list.innerHTML = "Belum ada akun Cloudflare yang ditambahkan.";
+          return;
+        }
+
+        list.innerHTML = "";
+        data.accounts.forEach(function(acc) {
+          // Tambah ke dropdown scan
+          var opt = document.createElement("option");
+          opt.value = acc.email;
+          opt.innerText = acc.email;
+          sel.appendChild(opt);
+
+          // Card box akun
+          var div = document.createElement("div");
+          div.style.cssText = "display:flex; justify-content:space-between; align-items:center; background:#1e293b; padding:10px; border-radius:8px; margin-top:6px; border:1px solid #334155;";
+          div.innerHTML = "<div>" +
+              "<div style='font-weight:bold; color:#38bdf8; font-size:13px;'>" + acc.email + "</div>" +
+              "<div style='color:#64748b; font-size:10px;'>Ditambahkan: " + acc.createdAt.split('T')[0] + "</div>" +
+            "</div>" +
+            "<button class='btn btn-sm btn-del-acc' style='background:#dc2626;'>Hapus</button>";
+
+          div.querySelector(".btn-del-acc").onclick = function() {
+            if (!confirm("Hapus akun " + acc.email + "?")) return;
+            fetch("/api/admin/cf-accounts/delete", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ adminSecret: currentToken, targetEmail: acc.email })
+            })
+            .then(function(r){ return r.json(); })
+            .then(function(res){
+              alert(res.message || res.error);
+              if (res.success) loadCfAccounts();
+            });
+          };
+
+          list.appendChild(div);
+        });
+      })
+      .catch(function(e) { list.innerHTML = "<span class='err'>Error: " + e.message + "</span>"; });
+    }
+
+    function fetchZones() {
+      var list = document.getElementById("zones-list");
+      var targetEmail = document.getElementById("select-scan-account").value;
+      list.innerHTML = "Memuat domain dari Cloudflare...";
+
+      fetch("/api/admin/fetch-zones", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminSecret: currentToken, targetEmail: targetEmail })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data.success) {
+          list.innerHTML = "<span class='err'>" + (data.error || "Gagal load domain") + "</span>";
+          return;
+        }
+
+        fetch("/api/admin/get-active-zones")
+        .then(function(r) { return r.json(); })
+        .then(function(activeData) {
+          var activeZones = activeData.activeZones || {};
+          list.innerHTML = "";
+
+          if (data.zones.length === 0) {
+            list.innerHTML = "Tidak ada domain di akun yang dipilih.";
+            return;
+          }
+
+          data.zones.forEach(function(z) {
+            var isAct = !!activeZones[z.name];
+            var div = document.createElement("div");
+            div.style.cssText = "display:flex; flex-direction:column; background:#1e293b; padding:12px; border-radius:10px; margin-top:10px; border:1px solid #334155; gap:8px;";
+            div.innerHTML = "<div style='display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;'>" +
+                "<div style='font-weight:bold; font-size:14px; word-break:break-all; color:#f8fafc;'>" + z.name + "</div>" +
+                "<span style='font-size:11px; color:#38bdf8; background:#0369a122; border:1px solid #0284c7; padding:2px 6px; rounded:4px; border-radius:4px;'>" + z.accountEmail + "</span>" +
+              "</div>" +
+              "<div style='display:flex; gap:8px; flex-wrap:wrap;'>" +
+                "<button class='btn btn-amber btn-sm btn-le' style='flex:1;'>Let's Encrypt</button>" +
+                "<button class='btn btn-blue btn-sm btn-ca' style='flex:1;'>Google CA</button>" +
+                "<button class='btn btn-sm btn-act' style='flex:1; background:" + (isAct ? "#16a34a" : "#475569") + ";'>" + (isAct ? "Aktif (Publik)" : "Jadikan Penyedia") + "</button>" +
+              "</div>";
+
+            div.querySelector(".btn-le").onclick = function() {
+              fetch("/api/admin/set-ca", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ adminSecret: currentToken, zoneId: z.id, accountEmail: z.accountEmail, ca: "lets_encrypt" })
+              }).then(function(r) { return r.json(); }).then(function(res) { alert(res.message || res.error); });
+            };
+
+            div.querySelector(".btn-ca").onclick = function() {
+              fetch("/api/admin/set-ca", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ adminSecret: currentToken, zoneId: z.id, accountEmail: z.accountEmail, ca: "google" })
+              }).then(function(r) { return r.json(); }).then(function(res) { alert(res.message || res.error); });
+            };
+
+            div.querySelector(".btn-act").onclick = function() {
+              fetch("/api/admin/toggle-zone", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ 
+                  adminSecret: currentToken, 
+                  zoneId: z.id, 
+                  domainName: z.name, 
+                  accountEmail: z.accountEmail,
+                  active: !isAct 
+                })
+              }).then(function(r) { return r.json(); }).then(function(res) { if (res.success) fetchZones(); else alert(res.error); });
+            };
+
+            list.appendChild(div);
+          });
+        });
+      })
+      .catch(function(err) { list.innerHTML = "<span class='err'>Gagal: " + err.message + "</span>"; });
+    }
+
+    function fetchUsers() {
+      var list = document.getElementById("users-list");
+      list.innerHTML = "Memuat data user...";
+
+      fetch("/api/admin/users/list", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminSecret: currentToken })
+      })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (!data.success) {
+          list.innerHTML = "<span class='err'>" + (data.error || "Gagal") + "</span>";
+          return;
+        }
+        list.innerHTML = "";
+        if (data.users.length === 0) {
+          list.innerHTML = "Belum ada user mendaftar.";
+          return;
+        }
+        data.users.forEach(function(u) {
+          var div = document.createElement("div");
+          div.style.cssText = "display:flex; justify-content:space-between; align-items:center; background:#1e293b; padding:10px; border-radius:8px; margin-top:6px; border:1px solid #334155;";
+          div.innerHTML = "<span style='font-family:monospace; font-size:13px; word-break:break-all;'>" + u + "</span>" +
+                          "<button class='btn btn-purple btn-sm'>Detail</button>";
+          div.querySelector("button").onclick = function() {
+            fetch("/api/admin/users/detail", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ adminSecret: currentToken, targetEmail: u })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+              if (d.success) {
+                var cDomains = d.customDomains ? d.customDomains.map(function(x){ return x.domainName; }).join(", ") : "-";
+                alert("Email: " + d.email + "\\nPass: " + d.password + "\\n\\nDomain Pribadi:\\n" + (cDomains || "-") + "\\n\\nSubdomain Dibuat:\\n" + (d.domains.join(", ") || "-"));
+              } else {
+                alert(d.error);
+              }
+            });
+          };
+          list.appendChild(div);
+        });
+      })
+      .catch(function(e) { list.innerHTML = "<span class='err'>Error: " + e.message + "</span>"; });
+    }
+  </script>
+</body>
+</html>`;
+}
+
+// --- UI USER PANEL (/) TETAP SAMA DENGAN DUKUNGAN AWAN OREN/ABU ---
+function getUserUI() {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Free Domain Provider</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .cloud-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen font-sans overflow-x-hidden">
+
+  <nav class="bg-white border-b border-slate-200 sticky top-0 z-30">
+    <div class="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center">
+      <div class="flex items-center gap-2">
+        <span class="bg-blue-600 text-white font-black text-xs px-2 py-1 rounded-md tracking-wider">FREE</span>
+        <h1 class="text-lg font-extrabold text-slate-900 tracking-tight">DomainHub</h1>
+      </div>
+      <div id="nav-user-info" class="hidden flex items-center gap-3">
+        <span id="user-display-email" class="text-xs text-slate-500 font-medium"></span>
+        <button onclick="logout()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs px-3 py-1.5 rounded-lg font-bold transition">Logout</button>
+      </div>
+    </div>
+  </nav>
+
+  <div class="max-w-4xl mx-auto p-4 sm:p-6 space-y-6">
+
+    <div id="auth-box" class="max-w-md mx-auto bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+      <div class="text-center space-y-1">
+        <h2 class="text-xl font-bold text-slate-900">Selamat Datang</h2>
+        <p class="text-xs text-slate-500">Daftar atau masuk untuk mulai mengklaim subdomain atau mendaftarkan domain pribadimu.</p>
+      </div>
+      <div class="space-y-3 pt-2">
+        <div>
+          <label class="text-xs font-medium text-slate-600">Email</label>
+          <input id="auth-email" type="email" placeholder="nama@email.com" class="p-2.5 rounded-xl bg-slate-50 border border-slate-300 w-full text-sm outline-none focus:border-blue-600 focus:bg-white mt-1">
+        </div>
+        <div>
+          <label class="text-xs font-medium text-slate-600">Password</label>
+          <input id="auth-pass" type="password" placeholder="••••••••" class="p-2.5 rounded-xl bg-slate-50 border border-slate-300 w-full text-sm outline-none focus:border-blue-600 focus:bg-white mt-1">
+        </div>
+      </div>
+      <div class="grid grid-cols-2 gap-3 pt-2">
+        <button onclick="login()" class="bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-xl font-bold text-sm shadow-sm transition">Login</button>
+        <button onclick="register()" class="bg-slate-900 hover:bg-slate-800 text-white py-2.5 rounded-xl font-bold text-sm shadow-sm transition">Register</button>
+      </div>
+    </div>
+
+    <div id="app-box" class="hidden space-y-6">
+
+      <div class="bg-gradient-to-br from-purple-900 to-slate-900 p-6 rounded-2xl text-white shadow-md space-y-4">
+        <div>
+          <span class="bg-purple-500/30 text-purple-300 text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider">Fitur Baru</span>
+          <h2 class="text-base sm:text-lg font-bold mt-1 text-white">Punya Domain Pribadi & Mau Mengatur DNS Via Web Ini?</h2>
+          <p class="text-xs text-slate-300 mt-1">Silakan daftarkan domainmu di sini. Arahkan Name Server domain kamu sesuai yang tertera nanti.</p>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-2">
+          <input id="custom-domain-name" type="text" placeholder="contohdomain.com" class="p-3 rounded-xl bg-slate-800/80 border border-slate-700 w-full text-sm font-medium outline-none focus:border-purple-400 text-white placeholder-slate-500">
+          <button onclick="addCustomDomain()" class="bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 px-5 rounded-xl text-sm transition shrink-0 shadow-sm">Daftarkan Domain</button>
+        </div>
+
+        <div class="pt-2">
+          <h3 class="text-xs font-bold text-slate-300 mb-2">Domain Pribadi Terdaftar Kamu:</h3>
+          <div id="custom-domains-list" class="space-y-2">
+            <p class="text-xs text-slate-400 italic">Belum ada domain pribadi yang kamu tambahkan.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-900">Cari Subdomain Baru</h2>
+          <p class="text-xs text-slate-500">Ketik nama subdomain pilihanmu dan pilih ekstensi domain penyedia.</p>
+        </div>
+
+        <div class="flex flex-col sm:flex-row gap-2">
+          <input id="sub-prefix" type="text" placeholder="subdomain-kamu" class="p-3 rounded-xl bg-slate-50 border border-slate-300 w-full text-sm font-medium outline-none focus:border-blue-600 focus:bg-white">
+          <select id="parent-domain" class="p-3 rounded-xl bg-slate-50 border border-slate-300 text-sm font-semibold outline-none focus:border-blue-600 w-full sm:w-auto text-slate-700"></select>
+          <button onclick="addDomain()" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-xl text-sm transition shrink-0 shadow-sm">Klaim Gratis</button>
+        </div>
+      </div>
+
+      <div class="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+        <div class="flex justify-between items-center">
+          <h2 class="text-lg font-bold text-slate-900">Domain / Subdomain Saya</h2>
+          <span id="domain-count" class="text-xs font-bold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full border border-blue-100">0 Domain</span>
+        </div>
+
+        <div id="my-domains-list" class="space-y-3">
+          <p class="text-xs text-slate-400">Belum ada domain yang dibuat.</p>
+        </div>
+      </div>
+
+    </div>
+
+  </div>
+
+  <!-- MODAL DNS -->
+  <div id="dns-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex justify-center items-center p-4 z-50">
+    <div class="bg-white p-6 rounded-2xl max-w-lg w-full space-y-4 shadow-2xl border border-slate-200 relative">
+      <div class="flex justify-between items-center border-b border-slate-100 pb-3">
+        <div>
+          <h3 id="modal-dns-title" class="text-base font-bold text-slate-900">Kelola DNS Record</h3>
+          <p id="modal-dns-sub" class="text-xs text-blue-600 font-mono font-medium"></p>
+        </div>
+        <button onclick="closeDnsModal()" class="text-slate-400 hover:text-slate-600 font-bold text-xl">&times;</button>
+      </div>
+
+      <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+        <input id="editing-record-id" type="hidden" value="">
+        
+        <div class="grid grid-cols-3 gap-2">
+          <div class="col-span-1">
+            <label class="text-[11px] font-semibold text-slate-500">Tipe</label>
+            <select id="dns-type" onchange="handleTypeChange()" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs font-bold outline-none focus:border-blue-600">
+              <option value="A">A</option>
+              <option value="AAAA">AAAA</option>
+              <option value="CNAME">CNAME</option>
+              <option value="TXT">TXT</option>
+              <option value="MX">MX</option>
+              <option value="SRV">SRV</option>
+              <option value="CAA">CAA</option>
+              <option value="HTTPS">HTTPS</option>
+            </select>
+          </div>
+          <div class="col-span-2">
+            <label class="text-[11px] font-semibold text-slate-500">Nama Host / Sub</label>
+            <input id="dns-name" type="text" placeholder="@ / www" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs outline-none focus:border-blue-600">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-3 gap-2">
+          <div class="col-span-2">
+            <label class="text-[11px] font-semibold text-slate-500">Isi / Target Value</label>
+            <input id="dns-content" type="text" placeholder="IP Address / Target Domain" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs outline-none focus:border-blue-600">
+          </div>
+          <div class="col-span-1">
+            <label class="text-[11px] font-semibold text-slate-500">TTL</label>
+            <select id="dns-ttl" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs outline-none focus:border-blue-600">
+              <option value="1">Auto</option>
+              <option value="60">1 Min</option>
+              <option value="120">2 Min</option>
+              <option value="300">5 Min</option>
+              <option value="600">10 Min</option>
+              <option value="1800">30 Min</option>
+              <option value="3600">1 Jam</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="proxy-container" class="flex items-center justify-between bg-white border border-slate-200 p-2.5 rounded-xl">
+          <div>
+            <span class="text-xs font-bold text-slate-800 block">Cloudflare Proxy Status</span>
+            <span id="proxy-desc" class="text-[10px] text-slate-500">DNS Only (Lalu lintas langsung ke server Anda)</span>
+          </div>
+          <button type="button" id="btn-toggle-proxy" onclick="toggleProxyInput()" class="cloud-btn px-2.5 py-1.5 rounded-lg border text-xs font-bold transition bg-slate-100 text-slate-600 border-slate-300">
+            <svg class="w-4 h-4 text-slate-400" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+            </svg>
+            <span id="proxy-label">DNS Only</span>
+          </button>
+        </div>
+
+        <div class="flex gap-2 pt-1">
+          <button id="btn-save-dns" onclick="saveDnsRecord()" class="bg-blue-600 hover:bg-blue-700 text-white flex-1 py-2 rounded-lg font-bold text-xs transition shadow-sm">Simpan DNS</button>
+          <button id="btn-cancel-dns" onclick="resetDnsForm()" class="hidden bg-slate-200 hover:bg-slate-300 text-slate-700 px-3 py-2 rounded-lg font-bold text-xs transition">Batal</button>
+        </div>
+      </div>
+
+      <div class="space-y-2">
+        <h4 class="text-xs font-bold text-slate-700">DNS Record Terpasang:</h4>
+        <div id="dns-records-list" class="space-y-1.5 max-h-56 overflow-y-auto pr-1"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL NS -->
+  <div id="ns-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex justify-center items-center p-4 z-50">
+    <div class="bg-white p-6 rounded-2xl max-w-lg w-full space-y-4 shadow-2xl border border-slate-200 relative">
+      <div class="flex justify-between items-center border-b border-slate-100 pb-3">
+        <div>
+          <h3 class="text-base font-bold text-slate-900">Ubah Name Server (NS)</h3>
+          <p id="modal-ns-sub" class="text-xs text-purple-600 font-mono font-medium"></p>
+        </div>
+        <button onclick="closeNsModal()" class="text-slate-400 hover:text-slate-600 font-bold text-xl">&times;</button>
+      </div>
+
+      <div class="bg-slate-50 p-4 rounded-xl border border-slate-200 space-y-3">
+        <div>
+          <label class="text-[11px] font-semibold text-slate-500">Nameserver 1</label>
+          <input id="ns1" type="text" placeholder="ns1.example.com" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs outline-none focus:border-purple-600">
+        </div>
+        <div>
+          <label class="text-[11px] font-semibold text-slate-500">Nameserver 2</label>
+          <input id="ns2" type="text" placeholder="ns2.example.com" class="mt-1 p-2 rounded-lg bg-white border border-slate-300 w-full text-xs outline-none focus:border-purple-600">
+        </div>
+        <button onclick="setNS()" class="bg-purple-600 hover:bg-purple-700 text-white w-full py-2.5 rounded-lg font-bold text-xs transition shadow-sm">Update Name Server</button>
+      </div>
+
+      <div class="space-y-2">
+        <h4 class="text-xs font-bold text-slate-700">Name Server Aktif:</h4>
+        <div id="ns-records-list" class="space-y-1.5 max-h-40 overflow-y-auto pr-1"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentUser = localStorage.getItem("subdomain_user") || "";
+    let activeSubdomainContext = "";
+    let activeParentDomain = "";
+    let isProxiedActive = false;
+
+    window.onload = function() {
+      if (currentUser) {
+        showApp();
+      }
+    };
+
+    function showApp() {
+      document.getElementById("auth-box").classList.add("hidden");
+      document.getElementById("app-box").classList.remove("hidden");
+      document.getElementById("nav-user-info").classList.remove("hidden");
+      document.getElementById("user-display-email").innerText = currentUser;
+      loadPublicDomains();
+      loadSubdomains();
+      loadCustomDomains();
+    }
+
+    function logout() {
+      localStorage.removeItem("subdomain_user");
+      currentUser = "";
+      location.reload();
+    }
+
+    async function register() {
+      const email = document.getElementById("auth-email").value;
+      const password = document.getElementById("auth-pass").value;
+      if (!email || !password) return alert("Email & Password wajib diisi!");
+
+      const res = await fetch("/api/register", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ email, password }) 
+      });
+      const data = await res.json();
+
+      if (data.success) {
+        currentUser = email;
+        localStorage.setItem("subdomain_user", email);
+        alert("Registrasi Berhasil! Anda otomatis masuk.");
+        showApp();
+      } else { 
+        alert(data.error); 
+      }
+    }
+
+    async function login() {
+      const email = document.getElementById("auth-email").value;
+      const password = document.getElementById("auth-pass").value;
+      if (!email || !password) return alert("Email & Password wajib diisi!");
+
+      const res = await fetch("/api/login", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ email, password }) 
+      });
+      const data = await res.json();
+      if (data.success) {
+        currentUser = email;
+        localStorage.setItem("subdomain_user", email);
+        showApp();
+      } else { alert(data.error); }
+    }
+
+    async function loadPublicDomains() {
+      const res = await fetch("/api/domains/public-list", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: currentUser })
+      });
+      const data = await res.json();
+      const parentSelect = document.getElementById("parent-domain");
+      parentSelect.innerHTML = "";
+      (data.domains || []).forEach(function(d) {
+        var opt = document.createElement("option");
+        opt.value = d;
+        opt.innerText = "." + d;
+        parentSelect.appendChild(opt);
+      });
+    }
+
+    async function addCustomDomain() {
+      const input = document.getElementById("custom-domain-name");
+      const domainName = input.value.trim();
+      if (!domainName) return alert("Masukkan nama domain pribadimu!");
+
+      const btn = event.target;
+      btn.innerText = "Mendaftarkan...";
+      btn.disabled = true;
+
+      try {
+        const res = await fetch("/api/user/custom-zone/add", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: currentUser, domainName })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          alert("Domain berhasil ditambahkan! Silakan ubah Nameserver domain kamu ke:\\n" + data.nameServers.join("\\n"));
+          input.value = "";
+          loadCustomDomains();
+          loadPublicDomains();
+        } else {
+          alert("Gagal: " + data.error);
+        }
+      } catch (e) {
+        alert("Error: " + e.message);
+      } finally {
+        btn.innerText = "Daftarkan Domain";
+        btn.disabled = false;
+      }
+    }
+
+    async function loadCustomDomains() {
+      const listDiv = document.getElementById("custom-domains-list");
+      try {
+        const res = await fetch("/api/user/custom-zone/list", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: currentUser })
+        });
+        const data = await res.json();
+
+        if (!data.success || !data.customZones || data.customZones.length === 0) {
+          listDiv.innerHTML = '<p class="text-xs text-slate-400 italic">Belum ada domain pribadi yang kamu tambahkan.</p>';
+          return;
+        }
+
+        listDiv.innerHTML = "";
+        data.customZones.forEach(function(z) {
+          var box = document.createElement("div");
+          box.className = "bg-slate-800/90 border border-slate-700 p-3 rounded-xl space-y-2 text-xs";
+          box.innerHTML = '<div class="flex justify-between items-center flex-wrap gap-2">' +
+              '<span class="font-bold text-sm text-purple-300 font-mono">' + z.domainName + '</span>' +
+              '<div class="flex gap-1.5">' +
+                '<button class="btn-pub px-2.5 py-1 rounded font-bold transition ' + (z.isPublic ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-300') + '">' + (z.isPublic ? 'Publik' : 'Privat') + '</button>' +
+                '<button class="btn-dns-c bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1 rounded font-bold transition">Atur DNS</button>' +
+                '<button class="btn-del-c bg-red-600 hover:bg-red-500 text-white px-2.5 py-1 rounded font-bold transition">Hapus</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="bg-slate-950/60 p-2 rounded border border-slate-800 text-[11px] font-mono text-slate-300">' +
+              '<span class="text-slate-400 font-sans block mb-1">Arahkan NS Domain ke:</span>' +
+              z.nameServers.map(function(ns){ return '<span class="inline-block bg-slate-900 border border-slate-700 px-1.5 py-0.5 rounded mr-1">' + ns + '</span>'; }).join('') +
+            '</div>';
+
+          box.querySelector(".btn-pub").onclick = function() { togglePublicDomain(z.domainName, !z.isPublic); };
+          box.querySelector(".btn-dns-c").onclick = function() { openDnsModal(z.domainName); };
+          box.querySelector(".btn-del-c").onclick = function() { deleteCustomDomain(z.domainName); };
+
+          listDiv.appendChild(box);
+        });
+      } catch (e) {
+        listDiv.innerHTML = '<p class="text-xs text-red-400">Gagal memuat domain pribadi.</p>';
+      }
+    }
+
+    async function togglePublicDomain(domainName, isPublic) {
+      const res = await fetch("/api/user/custom-zone/toggle-public", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: currentUser, domainName, isPublic })
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if (data.success) {
+        loadCustomDomains();
+        loadPublicDomains();
+      }
+    }
+
+    async function deleteCustomDomain(domainName) {
+      if (!confirm("Hapus domain pribadi " + domainName + " dari dashboard?")) return;
+      const res = await fetch("/api/user/custom-zone/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: currentUser, domainName })
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if (data.success) {
+        loadCustomDomains();
+        loadPublicDomains();
+      }
+    }
+
+    async function addDomain() {
+      const prefix = document.getElementById("sub-prefix").value;
+      const parentSelect = document.getElementById("parent-domain");
+      const parentDomain = parentSelect.value;
+      
+      if(!prefix) return alert("Isi nama subdomain!");
+      if(!parentDomain) return alert("Pilih domain penyedia!");
+      
+      const res = await fetch("/api/domains/add", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ email: currentUser, prefix, parentDomain }) 
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if (data.success) {
+        document.getElementById("sub-prefix").value = "";
+        loadSubdomains();
+      }
+    }
+
+    async function loadSubdomains() {
+      const res = await fetch("/api/domains/list", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ email: currentUser }) 
+      });
+      const data = await res.json();
+      const listDiv = document.getElementById("my-domains-list");
+      const countSpan = document.getElementById("domain-count");
+
+      listDiv.innerHTML = "";
+      countSpan.innerText = data.subdomains.length + " Domain";
+
+      if(data.subdomains.length === 0) {
+        listDiv.innerHTML = '<p class="text-xs text-slate-400">Belum ada subdomain yang dibuat.</p>';
+        return;
+      }
+
+      data.subdomains.forEach(function(sub) {
+        var subBox = document.createElement("div");
+        subBox.className = "flex flex-col sm:flex-row justify-between items-start sm:items-center bg-slate-50 p-4 rounded-xl border border-slate-200 gap-3 hover:border-slate-300 transition";
+        
+        subBox.innerHTML = '<div class="flex items-center gap-2">' +
+            '<span class="w-2 h-2 rounded-full bg-emerald-500"></span>' +
+            '<span class="text-sm font-bold text-slate-800 break-all">' + sub + '</span>' +
+          '</div>' +
+          '<div class="flex flex-wrap gap-1.5 w-full sm:w-auto">' +
+            '<button class="btn-dns bg-blue-50 hover:bg-blue-100 text-blue-600 border border-blue-200 text-xs px-3 py-1.5 rounded-lg font-bold transition flex-1 sm:flex-none">Atur DNS</button>' +
+            '<button class="btn-ns bg-purple-50 hover:bg-purple-100 text-purple-600 border border-purple-200 text-xs px-3 py-1.5 rounded-lg font-bold transition flex-1 sm:flex-none">Atur NS</button>' +
+            '<button class="btn-cp bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 text-xs px-3 py-1.5 rounded-lg font-bold transition">Copy</button>' +
+            '<button class="btn-del bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 text-xs px-2.5 py-1.5 rounded-lg font-bold transition">Hapus</button>' +
+          '</div>';
+
+        subBox.querySelector(".btn-dns").onclick = function() { openDnsModal(sub); };
+        subBox.querySelector(".btn-ns").onclick = function() { openNsModal(sub); };
+        subBox.querySelector(".btn-cp").onclick = function() { copyDomain(sub); };
+        subBox.querySelector(".btn-del").onclick = function() { deleteDomain(sub); };
+
+        listDiv.appendChild(subBox);
+      });
+    }
+
+    function openDnsModal(fullSubdomain) {
+      activeSubdomainContext = fullSubdomain;
+      document.getElementById("modal-dns-sub").innerText = fullSubdomain;
+      document.getElementById("dns-modal").classList.remove("hidden");
+      resetDnsForm();
+      loadDnsOnly();
+    }
+
+    function closeDnsModal() {
+      document.getElementById("dns-modal").classList.add("hidden");
+    }
+
+    function handleTypeChange() {
+      const type = document.getElementById("dns-type").value;
+      const proxyContainer = document.getElementById("proxy-container");
+      const isProxyable = ["A", "AAAA", "CNAME"].includes(type);
+
+      if (!isProxyable) {
+        setProxyState(false);
+        proxyContainer.classList.add("opacity-40", "pointer-events-none");
+      } else {
+        proxyContainer.classList.remove("opacity-40", "pointer-events-none");
+      }
+    }
+
+    function toggleProxyInput() {
+      setProxyState(!isProxiedActive);
+    }
+
+    function setProxyState(active) {
+      isProxiedActive = active;
+      const btn = document.getElementById("btn-toggle-proxy");
+      const desc = document.getElementById("proxy-desc");
+      const ttlSelect = document.getElementById("dns-ttl");
+
+      if (active) {
+        btn.className = "cloud-btn px-2.5 py-1.5 rounded-lg border text-xs font-bold transition bg-orange-50 text-orange-600 border-orange-300 shadow-sm";
+        btn.innerHTML = '<svg class="w-4 h-4 text-orange-500" viewBox="0 0 24 24" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg><span>Proxied</span>';
+        desc.innerText = "Proxied (Dilindungi Cloudflare CDN, IP server tersembunyi)";
+        ttlSelect.value = "1";
+        ttlSelect.disabled = true;
+      } else {
+        btn.className = "cloud-btn px-2.5 py-1.5 rounded-lg border text-xs font-bold transition bg-slate-100 text-slate-600 border-slate-300";
+        btn.innerHTML = '<svg class="w-4 h-4 text-slate-400" viewBox="0 0 24 24" fill="currentColor"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg><span>DNS Only</span>';
+        desc.innerText = "DNS Only (Bypass Cloudflare CDN, langsung ke IP server)";
+        ttlSelect.disabled = false;
+      }
+    }
+
+    async function loadDnsOnly() {
+      const dnsListDiv = document.getElementById("dns-records-list");
+      dnsListDiv.innerHTML = '<p class="text-xs text-slate-400">Loading DNS...</p>';
+
+      try {
+        const res = await fetch("/api/dns/list", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fullSubdomain: activeSubdomainContext })
+        });
+        const data = await res.json();
+
+        if(!data.success) {
+          dnsListDiv.innerHTML = '<p class="text-xs text-red-500">' + data.error + '</p>';
+          return;
+        }
+
+        activeParentDomain = data.parentDomain || "";
+        const dnsRecords = data.records.filter(r => r.type !== 'NS');
+        dnsListDiv.innerHTML = "";
+
+        if(dnsRecords.length === 0) {
+          dnsListDiv.innerHTML = '<p class="text-xs text-slate-400 italic">Belum ada DNS Record terpasang.</p>';
+        } else {
+          dnsRecords.forEach(function(r) {
+            var rBox = document.createElement("div");
+            rBox.className = "flex justify-between items-center bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-xs gap-1 hover:border-slate-300 transition";
+            
+            var cloudBadge = "";
+            var isProxyable = ["A", "AAAA", "CNAME"].includes(r.type);
+            if (isProxyable) {
+              if (r.proxied) {
+                cloudBadge = '<span title="Proxied (Klik untuk jadikan DNS Only)" class="cursor-pointer inline-flex items-center text-orange-500 hover:text-orange-600 bg-orange-100 px-1.5 py-0.5 rounded-md font-bold text-[10px]">' +
+                  '<svg class="w-3.5 h-3.5 mr-0.5 fill-current" viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>Proxied</span>';
+              } else {
+                cloudBadge = '<span title="DNS Only (Klik untuk aktifkan Proxied)" class="cursor-pointer inline-flex items-center text-slate-500 hover:text-slate-700 bg-slate-200 px-1.5 py-0.5 rounded-md font-bold text-[10px]">' +
+                  '<svg class="w-3.5 h-3.5 mr-0.5 fill-current" viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>DNS</span>';
+              }
+            }
+
+            rBox.innerHTML = '<div class="truncate mr-1 flex items-center gap-1.5">' +
+                '<span class="font-bold text-blue-600 bg-blue-100 px-1.5 py-0.5 rounded text-[10px]">' + r.type + '</span>' +
+                '<div class="btn-toggle-quick-proxy">' + cloudBadge + '</div>' +
+                '<span class="text-slate-700 font-medium truncate">' + r.name + '</span>' +
+                '<span class="text-slate-400">&rarr;</span>' +
+                '<span class="text-slate-500 font-mono truncate max-w-[120px]">' + r.content + '</span>' +
+              '</div>' +
+              '<div class="flex gap-1 shrink-0">' +
+                '<button class="btn-edt bg-amber-50 text-amber-600 border border-amber-200 text-[10px] px-2 py-1 rounded font-bold hover:bg-amber-100 transition">Edit</button>' +
+                '<button class="btn-del bg-red-50 text-red-600 border border-red-200 text-[10px] px-2 py-1 rounded font-bold hover:bg-red-100 transition">Hapus</button>' +
+              '</div>';
+
+            var qProxy = rBox.querySelector(".btn-toggle-quick-proxy span");
+            if (qProxy) {
+              qProxy.onclick = function() {
+                toggleQuickProxy(r.id, r.type, r.name, r.content, r.ttl, !r.proxied);
+              };
+            }
+
+            rBox.querySelector(".btn-edt").onclick = function() { fillDnsFormForEdit(r.id, r.type, r.name, r.content, r.ttl, r.proxied); };
+            rBox.querySelector(".btn-del").onclick = function() { deleteDnsRecord(r.id, 'dns'); };
+
+            dnsListDiv.appendChild(rBox);
+          });
+        }
+      } catch(e) {
+        dnsListDiv.innerHTML = '<p class="text-xs text-red-500">Gagal memuat data DNS.</p>';
+      }
+    }
+
+    async function toggleQuickProxy(id, type, name, content, ttl, newProxied) {
+      const res = await fetch("/api/dns/edit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fullSubdomain: activeSubdomainContext,
+          recordId: id,
+          type: type,
+          name: name,
+          content: content,
+          ttl: newProxied ? 1 : ttl,
+          proxied: newProxied
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        loadDnsOnly();
+      } else {
+        alert(data.error || "Gagal mengubah proxy");
+      }
+    }
+
+    function fillDnsFormForEdit(id, type, name, content, ttl, proxied) {
+      document.getElementById("editing-record-id").value = id;
+      document.getElementById("dns-type").value = type;
+      handleTypeChange();
+      
+      let hostPrefix = name;
+      if (type === "TXT" && activeParentDomain) {
+        if (name === activeParentDomain) hostPrefix = "@";
+        else if (name.endsWith("." + activeParentDomain)) hostPrefix = name.replace("." + activeParentDomain, "");
+      } else {
+        if (name === activeSubdomainContext) hostPrefix = "@";
+        else if (name.endsWith("." + activeSubdomainContext)) hostPrefix = name.replace("." + activeSubdomainContext, "");
+      }
+      
+      document.getElementById("dns-name").value = hostPrefix;
+      document.getElementById("dns-content").value = content;
+      document.getElementById("dns-ttl").value = ttl;
+
+      setProxyState(Boolean(proxied));
+
+      document.getElementById("btn-save-dns").innerText = "Update DNS Record";
+      document.getElementById("btn-save-dns").className = "bg-amber-600 hover:bg-amber-700 text-white flex-1 py-2 rounded-lg font-bold text-xs transition shadow-sm";
+      document.getElementById("btn-cancel-dns").classList.remove("hidden");
+    }
+
+    function resetDnsForm() {
+      document.getElementById("editing-record-id").value = "";
+      document.getElementById("dns-name").value = "";
+      document.getElementById("dns-content").value = "";
+      document.getElementById("dns-ttl").value = "1";
+      document.getElementById("dns-type").value = "A";
+      handleTypeChange();
+      setProxyState(false);
+
+      document.getElementById("btn-save-dns").innerText = "Simpan DNS";
+      document.getElementById("btn-save-dns").className = "bg-blue-600 hover:bg-blue-700 text-white flex-1 py-2 rounded-lg font-bold text-xs transition shadow-sm";
+      document.getElementById("btn-cancel-dns").classList.add("hidden");
+    }
+
+    async function saveDnsRecord() {
+      const recordId = document.getElementById("editing-record-id").value;
+      const type = document.getElementById("dns-type").value;
+      const name = document.getElementById("dns-name").value;
+      const content = document.getElementById("dns-content").value;
+      const ttl = document.getElementById("dns-ttl").value;
+
+      if(!content) return alert("Isi / Target record wajib diisi!");
+
+      const endpoint = recordId ? "/api/dns/edit" : "/api/dns/add";
+      const bodyPayload = { 
+        fullSubdomain: activeSubdomainContext, 
+        recordId, 
+        type, 
+        name, 
+        content, 
+        ttl,
+        proxied: isProxiedActive 
+      };
+
+      const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyPayload) });
+      const data = await res.json();
+      alert(data.message || (data.success ? "DNS Record Berhasil Disimpan!" : data.error));
+      
+      if (data.success) {
+        resetDnsForm();
+        loadDnsOnly();
+      }
+    }
+
+    function openNsModal(fullSubdomain) {
+      activeSubdomainContext = fullSubdomain;
+      document.getElementById("modal-ns-sub").innerText = fullSubdomain;
+      document.getElementById("ns-modal").classList.remove("hidden");
+      loadNsOnly();
+    }
+
+    function closeNsModal() {
+      document.getElementById("ns-modal").classList.add("hidden");
+    }
+
+    async function loadNsOnly() {
+      const nsListDiv = document.getElementById("ns-records-list");
+      nsListDiv.innerHTML = '<p class="text-xs text-slate-400">Loading NS...</p>';
+
+      try {
+        const res = await fetch("/api/dns/list", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fullSubdomain: activeSubdomainContext })
+        });
+        const data = await res.json();
+
+        if(!data.success) {
+          nsListDiv.innerHTML = '<p class="text-xs text-red-500">' + data.error + '</p>';
+          return;
+        }
+
+        const nsRecords = data.records.filter(r => r.type === 'NS');
+        nsListDiv.innerHTML = "";
+
+        if(nsRecords.length === 0) {
+          nsListDiv.innerHTML = '<p class="text-xs text-slate-400 italic">Belum ada Custom NS terpasang.</p>';
+        } else {
+          nsRecords.forEach(function(r, idx) {
+            var nsBox = document.createElement("div");
+            nsBox.className = "flex justify-between items-center bg-slate-50 p-2 rounded-lg border border-slate-200 text-xs gap-1";
+            
+            nsBox.innerHTML = '<div class="truncate mr-1">' +
+                '<span class="font-bold text-purple-600 bg-purple-100 px-1.5 py-0.5 rounded text-[10px] mr-1">NS ' + (idx + 1) + '</span>' +
+                '<span class="text-slate-700 font-mono">' + r.content + '</span>' +
+              '</div>' +
+              '<button class="btn-del bg-red-50 text-red-600 border border-red-200 text-[10px] px-2 py-1 rounded font-bold hover:bg-red-100 transition shrink-0">Hapus</button>';
+
+            nsBox.querySelector(".btn-del").onclick = function() { deleteDnsRecord(r.id, 'ns'); };
+
+            nsListDiv.appendChild(nsBox);
+          });
+        }
+      } catch(e) {
+        nsListDiv.innerHTML = '<p class="text-xs text-red-500">Gagal memuat data NS.</p>';
+      }
+    }
+
+    async function deleteDnsRecord(recordId, source) {
+      if(!confirm("Hapus record ini secara permanen dari Cloudflare?")) return;
+
+      const res = await fetch("/api/dns/delete-record", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fullSubdomain: activeSubdomainContext, recordId })
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if(data.success) {
+        if(source === 'dns') loadDnsOnly();
+        else loadNsOnly();
+      }
+    }
+
+    function copyDomain(text) {
+      navigator.clipboard.writeText(text).then(function() {
+        alert("Domain disalin: " + text);
+      }).catch(function() {
+        alert("Gagal menyalin domain!");
+      });
+    }
+
+    async function deleteDomain(fullSubdomain) {
+      if (!confirm("Yakin ingin menghapus " + fullSubdomain + " secara permanen?")) return;
+
+      const res = await fetch("/api/domains/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: currentUser, fullSubdomain })
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if (data.success) loadSubdomains();
+    }
+
+    async function setNS() {
+      const ns1 = document.getElementById("ns1").value;
+      const ns2 = document.getElementById("ns2").value;
+
+      if(!ns1 && !ns2) return alert("Isi minimal satu Nameserver!");
+
+      const res = await fetch("/api/dns/set-ns", { 
+        method: "POST", 
+        headers: { "Content-Type": "application/json" }, 
+        body: JSON.stringify({ fullSubdomain: activeSubdomainContext, ns1, ns2 }) 
+      });
+      const data = await res.json();
+      alert(data.message || data.error);
+      if (data.success) {
+        document.getElementById("ns1").value = "";
+        document.getElementById("ns2").value = "";
+        loadNsOnly();
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
